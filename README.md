@@ -1,5 +1,6 @@
 # F-18_Battery_Gauge
-F18 Hornet Battery Gauge for DCS
+
+Battery gauge in the ELEC Panel of the F18
 
 This code is primarily based on source Tanarg posted in the DCS Forums.
 It has been modified to work with the Waveshare ESP32-S3-LCD-1.28 along with some address changes in the DCSBios callbacks.
