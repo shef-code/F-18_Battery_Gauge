@@ -1,116 +1,149 @@
-/* 
-Create f-18 battery gauge on GC9A01 round 1.28 inch TFT display driven by ESP32 development board by Tanarg
-Gauge consists of background image and needle image (used twice)
+/*
+F/A-18 Battery Gauge — GC9A01 1.28" Round TFT (240x240) + ESP32 ( Origianlly based on Tanarg dev board)
+Library: TFT_eSPI (configure your GC9A01 and pins in User_Setup.h)
 
-Sketch uses the TFT_eSPI library, so you will need this loaded and configured, in partular ensure that the display, and pin out, is configured in User_Setup.h
+Key stability changes:
+- NO drawing in DCS-BIOS callbacks (ISR-safe): callbacks only store values + mark dirty.
+- Sprites created once in setup() and reused; no per-frame create/delete heap churn.
+- Render throttled in loop() (~30 FPS) with a watchdog refresh to avoid “blanking”.  We'll see how well it works!!
 */
 
-#define USE_HSPI_PORT          // ← Critical! Forces correct SPI2_HOST on ESP32-S3
+#define USE_HSPI_PORT          // ensure SPI2_HOST on ESP32-S3 via TFT_eSPI
 
-const byte colorDepth = 16;   // Increased to 16 from 8.
-
-#include "BatteryBackground.h" //Jpeg image array
-#include "Needle.h" //Jpeg image array
-
+#include <Arduino.h>
+#include <TFT_eSPI.h>
 #define DCSBIOS_DEFAULT_SERIAL
-#define DCSBIOS_DISABLE_SERVO 
+#define DCSBIOS_DISABLE_SERVO
 #include <DcsBios.h>
 
+#include "BatteryBackground.h" // uint16_t Battery[240*240]
+#include "Needle.h"            // uint16_t Needle[15*88]
 
-#include <TFT_eSPI.h>
+static const uint8_t  COLOR_DEPTH = 16;
+static const uint16_t CANVAS_W = 240, CANVAS_H = 240;
+
+// ── TFT & Sprites ───────────────────────────────────────────────────────────────
 TFT_eSPI tft = TFT_eSPI();
-TFT_eSprite gaugeBack = TFT_eSprite(&tft); // Sprite object for background
-TFT_eSprite needleU = TFT_eSprite(&tft); // Sprite object for left needle
-TFT_eSprite needleE = TFT_eSprite(&tft); // Sprite object for right needle
+TFT_eSprite gaugeBack(&tft);   // full-frame canvas
+TFT_eSprite needleU(&tft);     // left needle
+TFT_eSprite needleE(&tft);     // right needle
 
-int angleMapU = 0; // Declare int value for needle angles
-int angleMapE = 0;
+// ── State updated by DCS callbacks (ISR-safe) ───────────────────────────────────
+static volatile uint16_t rawU = 0;
+static volatile uint16_t rawE = 0;
+static volatile bool     dirtyU = false;
+static volatile bool     dirtyE = false;
+static volatile uint32_t lastDcsMs = 0;
 
-void onVoltUChange(unsigned int newValue) {
+// ── Render scheduler ───────────────────────────────────────────────────────────
+static uint32_t lastFrameMs = 0;
+static const uint32_t FRAME_INTERVAL_MS = 33;  // ~30 FPS
+static const uint32_t WATCHDOG_MS       = 500; // force refresh if DCS active
 
-  angleMapU = map (newValue, 0, 65535, -150, -30);   // Take input for left needle (battery identifier (U). 0-65535 is input value range from DCS. -150 to -30 is the range of the left needle in degrees
-  plotGauge (angleMapU, angleMapE);                 //redraw both needles irrespective if only one input value has changed
+// ── Forward decls ──────────────────────────────────────────────────────────────
+static inline int16_t map_u(uint16_t v) { return map(v, 0, 65535, -150, -30); } // left needle (U)
+static inline int16_t map_e(uint16_t v) { return map(v, 0, 65535,  150,  30); } // right needle (E)
+void renderGauge(int16_t angleU, int16_t angleE);
+void bitTest();
+
+// ── DCS-BIOS callbacks (keep these tiny) ───────────────────────────────────────
+void onVoltUChange(unsigned int v) {
+  rawU = (uint16_t)v;
+  dirtyU = true;
+  lastDcsMs = millis();
 }
 DcsBios::IntegerBuffer voltUBuffer(0x753c, 0xffff, 0, onVoltUChange);
 
-
-void onVoltEChange(unsigned int newValue) {
-
-  angleMapE = map (newValue, 0, 65535, 150, 30); // Take input for right needle (E)
-  plotGauge (angleMapU, angleMapE); //redraw both needles irrespective if only one input value has changed
+void onVoltEChange(unsigned int v) {
+  rawE = (uint16_t)v;
+  dirtyE = true;
+  lastDcsMs = millis();
 }
 DcsBios::IntegerBuffer voltEBuffer(0x753e, 0xffff, 0, onVoltEChange);
 
-void setup() 
-{
+// ── Setup ──────────────────────────────────────────────────────────────────────
+void setup() {
+  // Serial for debug (optional)
+  Serial.begin(115200);
+
   DcsBios::setup();
+
   tft.begin();
-  tft.fillScreen (TFT_BLACK);
-  
-  gaugeBack.setSwapBytes (true); // Depending on Sprite graphics byte order these may, or may not, be required
-  needleU.setSwapBytes (true); 
-  needleE.setSwapBytes (true); 
-  bitTest ();  // This can be comented out if not required or removed completely, along with the function
+  tft.fillScreen(TFT_BLACK);
+  tft.setSwapBytes(true); // for 16-bit image arrays
+
+  // Create sprites once; reuse forever
+  gaugeBack.setColorDepth(COLOR_DEPTH);
+  gaugeBack.createSprite(CANVAS_W, CANVAS_H);
+  gaugeBack.setSwapBytes(true);
+  gaugeBack.setPivot(CANVAS_W/2, CANVAS_H/2);
+
+  needleU.setColorDepth(COLOR_DEPTH);
+  needleU.createSprite(15, 88);
+  needleU.setSwapBytes(true);
+  needleU.setPivot(7, 84);
+  needleU.pushImage(0, 0, 15, 88, Needle);
+
+  needleE.setColorDepth(COLOR_DEPTH);
+  needleE.createSprite(15, 88);
+  needleE.setSwapBytes(true);
+  needleE.setPivot(7, 84);
+  needleE.pushImage(0, 0, 15, 88, Needle);
+
+  // First paint
+  renderGauge(map_u(rawU), map_e(rawE));
+
+  // Optional built-in test
+  bitTest();
 }
 
-void loop() 
-{
-  DcsBios::loop(); 
-  delay(50);        //Added this delay. I think the display is being overwhelmed with updates
-                    //causing the screen to blank out once connected to DCS. The problem is intermittent
-                    //so I dont know if this fixes anything.   Probably a better way to handle it too.
-}
+// ── Main loop ──────────────────────────────────────────────────────────────────
+void loop() {
+  DcsBios::loop();
 
-void bitTest () // Test full range of both needles
-{ 
-  for (int i = 0; i < 120; i += 5){             // Test range of both needles from min to max
-    int angleMapU = map (i, 0, 120, -150, -30); // Up (0) is the default starting point for the needle. needleU will move clockwise on the left of the gauge
-    int angleMapE = map (i, 0, 120, 150, 30);   // needleE will move anti-clockwise on the right of the gauge
-    plotGauge (angleMapU, angleMapE);
+  const uint32_t now = millis();
+  const bool anyDirty = dirtyU || dirtyE;
+  const bool frameDue = (now - lastFrameMs) >= FRAME_INTERVAL_MS;
+  const bool dcsActive = (now - lastDcsMs) < 2000; // consider “active” if data within last 2s
+  const bool watchdogKick = dcsActive && ((now - lastFrameMs) >= WATCHDOG_MS);
+
+  if ((anyDirty && frameDue) || watchdogKick) {
+    // Snapshot volatile values once (avoid tearing)
+    noInterrupts();
+    const uint16_t u = rawU;
+    const uint16_t e = rawE;
+    dirtyU = false;
+    dirtyE = false;
+    interrupts();
+
+    renderGauge(map_u(u), map_e(e));
+    lastFrameMs = now;
   }
 
-  for (int i = 119; i >= 0; i -= 5) // Test range of both needles from max to min
-  { 
-    int angleMapE = map (i, 0, 120, 150, 30);
-    int angleMapU = map (i, 0, 120, -150, -30);
-    plotGauge (angleMapU, angleMapE);
+ }
+
+// ── Rendering (heavy work lives here, not in callbacks) ────────────────────────
+void renderGauge(int16_t angleU, int16_t angleE) {
+  // Clear canvas + draw static background
+  gaugeBack.fillSprite(TFT_BLACK);
+  gaugeBack.pushImage(0, 0, CANVAS_W, CANVAS_H, Battery);
+
+  // Rotate needles into the canvas (transparent background)
+  needleU.pushRotated(&gaugeBack, angleU, TFT_TRANSPARENT);
+  needleE.pushRotated(&gaugeBack, angleE, TFT_TRANSPARENT);
+
+  // Push full frame to screen
+  gaugeBack.pushSprite(0, 0);
+}
+
+// ── Optional: range test (manual BIT) ──────────────────────────────────────────
+void bitTest() {
+  for (int i = 0; i <= 120; i += 5) {
+    renderGauge(map(i, 0, 120, -150, -30), map(i, 0, 120, 150, 30));
+    delay(10);
   }
-}
-
-void plotGauge (int16_t angleU, int16_t angleE) // Function takes both needle U & E input values, creates needle rotations and pushes them into background image (Sprite)
-{ 
-  createBackground (); // Create Sprites
-  createNeedleU (); 
-  createNeedleE (); 
-  needleU.pushRotated (&gaugeBack, angleU, TFT_TRANSPARENT);
-  needleE.pushRotated (&gaugeBack, angleE, TFT_TRANSPARENT);
-  gaugeBack.pushSprite (0, 0, TFT_TRANSPARENT);
-  gaugeBack.deleteSprite (); // Delete Sprites to free up memory
-  needleU.deleteSprite();
-  needleE.deleteSprite();
-}
-
-void createBackground () //Create battery dial background as full screen Sprite and set pivot point for needles 
-{ 
-  gaugeBack.setColorDepth (colorDepth);
-  gaugeBack.createSprite (240, 240); // Size of the screen in pixels
-  gaugeBack.setPivot (120, 120); // Pivot point in centre of screen (Gauge)
-  gaugeBack.fillSprite (TFT_TRANSPARENT);
-  gaugeBack.pushImage (0, 0, 240, 240, Battery); // (x, y, dwidth, dheight, image);
-}
-
-void createNeedleU () // Create needles as Sprites from single graphic and set pivot point
-{ 
-  needleU.setColorDepth (colorDepth);
-  needleU.createSprite (15, 88); //Size of the needle (must be accurate)
-  needleU.setPivot (7, 84);  // Pivot point of the needle  
-  needleU.pushImage (0, 0, 15, 88, Needle); // (x, y, dwidth, dheight, image);
-}
-
-void createNeedleE () // Create needles as Sprites from single graphic and set pivot point
-{ 
-  needleE.setColorDepth (colorDepth);
-  needleE.createSprite (15, 88); //Size of the needle (must be accurate)
-  needleE.setPivot (7, 84);  // Pivot point of the needle 
-  needleE.pushImage (0, 0, 15, 88, Needle); // (x, y, dwidth, dheight, image);
+  for (int i = 120; i >= 0; i -= 5) {
+    renderGauge(map(i, 0, 120, -150, -30), map(i, 0, 120, 150, 30));
+    delay(10);
+  }
 }
