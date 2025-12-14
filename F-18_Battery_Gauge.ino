@@ -7,7 +7,7 @@ Sketch uses the TFT_eSPI library, so you will need this loaded and configured, i
 
 #define USE_HSPI_PORT          // ← Critical! Forces correct SPI2_HOST on ESP32-S3
 
-const byte colorDepth = 16; // Increasing this beyond 8 may cause graphic image issues
+const byte colorDepth = 16;   // Increased to 16 from 8.
 
 #include "BatteryBackground.h" //Jpeg image array
 #include "Needle.h" //Jpeg image array
@@ -56,6 +56,9 @@ void setup()
 void loop() 
 {
   DcsBios::loop(); 
+  delay(50);        //Added this delay. I think the display is being overwhelmed with updates
+                    //causing the screen to blank out once connected to DCS. The problem is intermittent
+                    //so I dont know if this fixes anything.   Probably a better way to handle it too.
 }
 
 void bitTest () // Test full range of both needles
