@@ -119,13 +119,14 @@ void loop() {
     renderGauge(map_u(u), map_e(e));
     lastFrameMs = now;
   }
-
+  
+  yield();
  }
 
 // ── Rendering (heavy work lives here, not in callbacks) ────────────────────────
 void renderGauge(int16_t angleU, int16_t angleE) {
   // Clear canvas + draw static background
-  gaugeBack.fillSprite(TFT_BLACK);
+  //gaugeBack.fillSprite(TFT_BLACK);
   gaugeBack.pushImage(0, 0, CANVAS_W, CANVAS_H, Battery);
 
   // Rotate needles into the canvas (transparent background)
